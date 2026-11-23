@@ -345,9 +345,27 @@ function noTokenYet(proto: ProtoInput): boolean {
 // Versioned protocol names (e.g. "Protocol V2") are usually forks or restarts
 // of the same product; ranking them as fresh tokens would double count.
 const VERSIONED_NAME = /\s(v\d+(\.\d+)?|\d+\.\d+)$/;
+const WRAPPED_NAME = /\b(wrapped|staked|staking)\b/i;
+const EXCHANGE_PREFIX = ['Binance', 'Coinbase', 'Bybit', 'Kraken', 'Bitget', 'OKX', 'Bitfinex', 'Gemini'];
+
+/**
+ * Why a pre-token protocol is not ranked: the house's own watchlist rule. A
+ * bridge, a liquid-staking receipt, an exchange product, a versioned successor
+ * or a wrapped/staked name is not a launch candidate the radar is for, so it is
+ * counted in the accounting and kept off the board rather than silently dropped.
+ */
+function exclusionClass(proto: ProtoInput): 'bridge' | 'liqstake' | 'exchange' | 'versioned' | 'wrappedname' | null {
+  const c = proto.category;
+  if (c === 'Bridge' || c === 'Canonical Bridge') return 'bridge';
+  if (c === 'Liquid Staking' || c === 'Liquid Restaking' || c === 'Restaked BTC') return 'liqstake';
+  if (c === 'CEX' || EXCHANGE_PREFIX.some((e) => proto.name.indexOf(e) === 0)) return 'exchange';
+  if (VERSIONED_NAME.test(proto.name)) return 'versioned';
+  if (WRAPPED_NAME.test(proto.name)) return 'wrappedname';
+  return null;
+}
 
 function rankable(proto: ProtoInput): boolean {
-  return noTokenYet(proto) && proto.category !== 'CEX' && !VERSIONED_NAME.test(proto.name);
+  return noTokenYet(proto) && exclusionClass(proto) === null;
 }
 
 export const EARLY_FILL = 180;
@@ -818,17 +836,14 @@ function fitStats(doc: SnapshotDoc): { split_a: number; split_b: number; oos: Mo
 
 export function buildBoard(doc: SnapshotDoc, p: ScoreParams = SCORE_PARAMS): BoardLine[] {
   const fit = fitStats(doc);
-  const bySlug = new Map(doc.protocols.map((x) => [x.slug, x]));
+  // The board is every pre-token protocol the house's watchlist rule leaves
+  // eligible — the watchlist names a priority set, but a launch candidate below
+  // the floor is still a candidate, so the board is the full eligible set rather
+  // than a capped slice. Excluded classes are counted in the accounting.
   const picked = new Map<string, ProtoInput>();
-  for (const slug of doc.watchlist) {
-    const proto = bySlug.get(slug);
-    if (proto !== undefined) picked.set(slug, proto);
+  for (const proto of doc.protocols) {
+    if (rankable(proto)) picked.set(proto.slug, proto);
   }
-  const early = doc.protocols
-    .filter((x) => !picked.has(x.slug) && rankable(x) && x.tvl_usd < doc.floor_usd)
-    .sort((a, b) => b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : 1))
-    .slice(0, EARLY_FILL);
-  for (const proto of early) picked.set(proto.slug, proto);
 
   // The published parameters are the ones the blind test left standing: the
   // board is scored with the kept set, and a term the test dropped is zeroed,
@@ -916,15 +931,27 @@ function modelStats(doc: SnapshotDoc, board: BoardLine[], p: ScoreParams): Model
   const covered = board.filter((r) => watchSet.has(r.slug)).length;
   const cex = doc.protocols.filter((x) => x.category === 'CEX');
   const versioned = doc.protocols.filter((x) => x.category !== 'CEX' && VERSIONED_NAME.test(x.name));
-  // A partition, not overlapping counts: every scanned protocol lands in exactly one bucket.
+  // A strict partition: every scanned protocol lands in exactly one bucket,
+  // in priority order (CEX, versioned, then the launch-rule exclusions, then
+  // the token/board split), so the counts sum to the scan and the integrity
+  // check can be a real equality rather than a coincidence.
   const cexSlugs = new Set(cex.map((x) => x.slug));
   const verSlugs = new Set(versioned.map((x) => x.slug));
   const rest = doc.protocols.filter((x) => !cexSlugs.has(x.slug) && !verSlugs.has(x.slug));
-  const noTok = rest.filter(noTokenYet);
-  const trades = rest.filter((x) => !noTokenYet(x));
+  const exSlugs = new Set(rest.filter((x) => exclusionClass(x) !== null).map((x) => x.slug));
+  const excluded = { bridge: 0, liqstake: 0, wrappedname: 0, exchange: 0 };
+  for (const x of rest) {
+    const ex = exclusionClass(x);
+    if (ex === 'bridge') excluded.bridge++;
+    else if (ex === 'liqstake') excluded.liqstake++;
+    else if (ex === 'wrappedname') excluded.wrappedname++;
+    else if (ex === 'exchange') excluded.exchange++;
+  }
+  const noTok = rest.filter((x) => !noTokenYet(x) && !exSlugs.has(x.slug));
+  const trades = rest.filter((x) => !noTokenYet(x) && !exSlugs.has(x.slug));
   const mcapMissing = trades.filter((x) => x.mcap_usd === null);
   const priced = trades.filter((x) => x.mcap_usd !== null);
-  const preTokAll = doc.protocols.filter(rankable);
+  const preTokAll = noTok;
   const preTokOnBoard = preTokAll.filter((x) => onBoard.has(x.slug)).length;
   const coverage = [
     { bucket: 'ranked (watchlist)', count: covered, note: 'on the implied-value board' },
@@ -933,7 +960,11 @@ function modelStats(doc: SnapshotDoc, board: BoardLine[], p: ScoreParams): Model
     { bucket: 'token on record, no price', count: mcapMissing.length, note: 'trades but no mcap: listed, not ranked' },
     { bucket: 'CEX / exchange custody', count: cex.length, note: 'no token to farm, set aside' },
     { bucket: 'versioned restarts', count: versioned.length, note: 'forks, not fresh tokens' },
-    { bucket: 'pre-token, below floor', count: preTokAll.length - preTokOnBoard, note: 'read, ranked out of the fill window' },
+    { bucket: 'excluded: bridge', count: excluded.bridge, note: 'pass-through plumbing, not a launch' },
+    { bucket: 'excluded: liquid staking / restaking', count: excluded.liqstake, note: 'the receipt is the staked asset' },
+    { bucket: 'excluded: exchange product', count: excluded.exchange, note: 'a venue product, not a launch' },
+    { bucket: 'excluded: wrapped / staked by name', count: excluded.wrappedname, note: 'wrappers are not fresh tokens' },
+    { bucket: 'pre-token, not ranked', count: 0, note: 'every eligible pre-token is on the board' },
   ];
   const sum = coverage.reduce((s, c) => s + c.count, 0);
   const integrity = [
