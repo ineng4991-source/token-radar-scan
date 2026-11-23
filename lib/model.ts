@@ -85,7 +85,7 @@ export const SCORE_PARAMS: ScoreParams = {
   max_implied: 99_999_999_999_999,
 };
 
-export const SCORE_TAG = 'radar-score v12';
+export const SCORE_TAG = 'radar-score v14';
 
 // Base weight: the share of TVL that a token of this category could plausibly
 // command at launch. Chains and curators sit at the top because their tokens
@@ -153,7 +153,11 @@ export interface BoardLine {
   token_status: 'pre-token';
   age_days: number | null;
   implied_value_usd: number;
+  value_if_launched_usd: number;
   token_odds: number;
+  odds_brier_cv: number;
+  odds_brier_wf: number;
+  odds_base_rate: number;
   /** True when the snapshot's own watchlist names this slug. */
   on_watch: boolean;
   /** A printed range around the point: the model's own low and high on this row. */
@@ -406,6 +410,168 @@ function tokenOddsOf(proto: ProtoInput, asOf: string, universeTvl: number): numb
   const ageLogit = Math.min(Math.max(age, 30), 900) / 450 - 1;
   const raw = -2.1 + 0.9 * sizeLogit + 0.55 * growthLogit + 0.5 * ageLogit;
   return Math.max(0.01, Math.min(0.99, 1 / (1 + Math.exp(-raw))));
+}
+
+/* ---------------- launch odds: a fitted model, not a heuristic ----------------
+   Outcome: the protocol records a token by the snapshot date. Fit: logistic
+   regression by iteratively-reweighted least squares on the dated protocols,
+   with features read off the snapshot (log TVL, growth, log age, chain count)
+   and category effects shrunk toward the global rate by the category's size,
+   the same discipline the value side uses for its peer multiples. A 10-fold
+   cross-validated Brier score and a walk-forward Brier score are reported, so
+   the odds the board ranks on are measured out of sample, not asserted. */
+const ODDS_SHRINK_K = 6;
+const ODDS_RIDGE = 1e-4;
+
+function dotv(a: number[], b: number[]): number {
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += a[i]! * b[i]!;
+  return s;
+}
+function solveLin(A: number[][], b: number[]): number[] {
+  const n = b.length;
+  const M = A.map((r, i) => r.concat(b[i]));
+  for (let c = 0; c < n; c++) {
+    let piv = c;
+    for (let r = c + 1; r < n; r++) if (Math.abs(M[r]![c]!) > Math.abs(M[piv]![c]!)) piv = r;
+    if (Math.abs(M[piv]![c]!) < 1e-12) M[piv]![c] = 1e-12;
+    const t = M[c]!; M[c] = M[piv]!; M[piv] = t;
+    for (let r = 0; r < n; r++) {
+      if (r === c) continue;
+      const f = M[r]![c]! / M[c]![c]!;
+      if (f === 0) continue;
+      for (let k = c; k <= n; k++) M[r]![k] = M[r]![k]! - f * M[c]![k]!;
+    }
+  }
+  return M.map((r, i) => r[n]! / M[i]![i]!);
+}
+
+interface OddsRow { slug: string; token: boolean; size: number; growth: number; age: number; chains: number; cat: string; }
+
+function oddsRows(doc: SnapshotDoc): OddsRow[] {
+  const medAge = median(doc.protocols.map((x) => daysSince(doc.as_of, x.listed_at)).filter((v): v is number => v != null)) ?? 400;
+  const ages = doc.protocols.map((x) => daysSince(doc.as_of, x.listed_at) ?? medAge);
+  const meanLnTvl = meanv(doc.protocols.map((x) => Math.log(Math.max(x.tvl_usd, 1))));
+  const rows: OddsRow[] = [];
+  doc.protocols.forEach((x, i) => {
+    rows.push({
+      slug: x.slug,
+      token: !noTokenYet(x),
+      size: Math.log(Math.max(x.tvl_usd, 1)) - meanLnTvl,
+      growth: Math.min(Math.max(num(x.change_7d, 0), -30), 30) / 30,
+      age: Math.log(1 + ages[i]!),
+      chains: x.chains.length / 3,
+      cat: x.category ?? 'Uncategorised',
+    });
+  });
+  return rows;
+}
+
+function meanv(a: number[]): number { return a.length ? a.reduce((s, v) => s + v, 0) / a.length : 0; }
+
+interface OddsModel {
+  predict: (proto: ProtoInput, doc: SnapshotDoc) => number;
+  brierCv: number;
+  brierWf: number;
+  baseRate: number;
+  n: number;
+  catRates: Map<string, { rate: number; traded: number; size: number }>;
+  terms: string[];
+}
+
+function oddsXrow(r: OddsRow, cats: string[]): number[] {
+  return [1, r.size, r.growth, r.age, r.chains, ...cats.map((c) => (r.cat === c ? 1 : 0))];
+}
+
+function fitOddsSub(rows: OddsRow[], cats: string[]): (r: OddsRow) => number {
+  const cols = ['const', 'size', 'growth', 'age', 'chains', ...cats.map((c) => 'cat:' + c)];
+  const pen = cols.map((c) => (c === 'const' ? 0 : c.startsWith('cat:') ? 6 : ODDS_RIDGE));
+  const X = rows.map((r) => oddsXrow(r, cats));
+  const y = rows.map((r) => (r.token ? 1 : 0));
+  let beta = new Array(cols.length).fill(0);
+  for (let it = 0; it < 20; it++) {
+    const A = Array.from({ length: cols.length }, () => new Array(cols.length).fill(0));
+    const b = new Array(cols.length).fill(0);
+    for (let i = 0; i < rows.length; i++) {
+      const eta = Math.max(-30, Math.min(30, dotv(X[i]!, beta)));
+      const pr = 1 / (1 + Math.exp(-eta));
+      const w = Math.max(pr * (1 - pr), 1e-6);
+      const z = eta + (y[i]! - pr) / w;
+      for (let a = 0; a < cols.length; a++) {
+        if (X[i]![a] === 0) continue;
+        b[a] += X[i]![a]! * w * z;
+        for (let c = 0; c < cols.length; c++) A[a]![c] += X[i]![a]! * w * X[i]![c]!;
+      }
+    }
+    for (let a = 0; a < cols.length; a++) A[a]![a] += pen[a]! + 1e-9;
+    const next = solveLin(A, b);
+    const shift = Math.max(...next.map((v, i) => Math.abs(v - beta[i]!)));
+    beta = next;
+    if (it > 3 && shift < 1e-7) break;
+  }
+  return (r: OddsRow) => {
+    const x = oddsXrow(r, cats);
+    const eta = Math.max(-30, Math.min(30, dotv(x, beta)));
+    return Math.max(0.02, Math.min(0.98, 1 / (1 + Math.exp(-eta))));
+  };
+}
+
+function fitOdds(rows: OddsRow[]): OddsModel {
+  const globalRate = meanv(rows.map((r) => (r.token ? 1 : 0)));
+  const groups = new Map<string, { traded: number; size: number }>();
+  for (const r of rows) {
+    const g = groups.get(r.cat) ?? { traded: 0, size: 0 };
+    g.size += 1;
+    if (r.token) g.traded += 1;
+    groups.set(r.cat, g);
+  }
+  const catRates = new Map<string, { rate: number; traded: number; size: number }>();
+  for (const [cat, g] of groups) {
+    const w = g.size / (g.size + ODDS_SHRINK_K);
+    catRates.set(cat, { rate: w * (g.traded / g.size) + (1 - w) * globalRate, traded: g.traded, size: g.size });
+  }
+  const cats = [...catRates.keys()].filter((c) => (catRates.get(c)!.size ?? 0) >= 8).sort();
+  const cols = ['const', 'size', 'growth', 'age', 'chains', ...cats.map((c) => 'cat:' + c)];
+  // 10-fold CV Brier
+  const cvPred = new Array<number>(rows.length).fill(globalRate);
+  for (let f = 0; f < 10; f++) {
+    const trIdx = rows.map((_, i) => i).filter((i) => i % 10 !== f);
+    const teIdx = rows.map((_, i) => i).filter((i) => i % 10 === f);
+    const sub = trIdx.map((i) => rows[i]!);
+    const m = fitOddsSub(sub, cats);
+    for (const i of teIdx) cvPred[i] = m(rows[i]!);
+  }
+  const brierCv = meanv(rows.map((r, i) => (cvPred[i]! - (r.token ? 1 : 0)) ** 2));
+  // walk-forward Brier
+  const byAge = rows.map((r, i) => ({ r, i })).sort((a, b) => a.r.age - b.r.age || (a.r.slug < b.r.slug ? -1 : 1));
+  const wfPreds: number[] = [];
+  const wfY: number[] = [];
+  const n = byAge.length;
+  for (const frac of [0.4, 0.6, 0.8]) {
+    const cut = Math.floor(n * frac);
+    const tr = byAge.slice(0, cut).map((x) => x.r);
+    const te = byAge.slice(cut, Math.floor(n * Math.min(frac + 0.2, 1))).map((x) => x.r);
+    if (!te.length) continue;
+    const m = fitOddsSub(tr, cats);
+    te.forEach((r) => { wfPreds.push(m(r)); wfY.push(r.token ? 1 : 0); });
+  }
+  const brierWf = meanv(wfPreds.map((p, i) => (p - wfY[i]!) ** 2));
+  // final full fit for prediction
+  const finalFn = fitOddsSub(rows, cats);
+  const predict = (proto: ProtoInput, doc: SnapshotDoc): number => {
+    const medAge = median(doc.protocols.map((x) => daysSince(doc.as_of, x.listed_at)).filter((v): v is number => v != null)) ?? 400;
+    const meanLnTvl = meanv(doc.protocols.map((x) => Math.log(Math.max(x.tvl_usd, 1))));
+    const age = daysSince(doc.as_of, proto.listed_at) ?? medAge;
+    const r: OddsRow = {
+      slug: proto.slug, token: false,
+      size: Math.log(Math.max(proto.tvl_usd, 1)) - meanLnTvl,
+      growth: Math.min(Math.max(num(proto.change_7d, 0), -30), 30) / 30,
+      age: Math.log(1 + age), chains: proto.chains.length / 3,
+      cat: proto.category ?? 'Uncategorised',
+    };
+    return finalFn(r);
+  };
+  return { predict, brierCv, brierWf, baseRate: globalRate, n: rows.length, catRates, terms: cols };
 }
 
 function peersOf(proto: ProtoInput, all: ProtoInput[], limit = 5): BoardLine['peers'] {
@@ -737,18 +903,22 @@ export function buildBoard(doc: SnapshotDoc, p: ScoreParams = SCORE_PARAMS): Boa
 
   const universeTvl = doc.protocols.reduce((s, x) => s + x.tvl_usd, 0);
   const watchSet = new Set(doc.watchlist);
+  // Rank by expected value: implied value if it launches, weighted by the fitted
+  // odds it does. The odds are measured (CV + walk-forward Brier), not asserted.
+  const oddsModel = fitOdds(oddsRows(doc));
   const scored = [...picked.values()].map((proto) => {
     const { value, breakdown } = impliedUsd(proto, doc.as_of, fp, pb);
-    return { proto, value, breakdown, age: daysSince(doc.as_of, proto.listed_at) };
+    const odds = oddsModel.predict(proto, doc);
+    return { proto, value, breakdown, age: daysSince(doc.as_of, proto.listed_at), odds, expected: value * odds };
   });
-  scored.sort((a, b) => b.value - a.value || (a.proto.slug < b.proto.slug ? -1 : 1));
+  scored.sort((a, b) => b.expected - a.expected || (a.proto.slug < b.proto.slug ? -1 : 1));
   const v = fit.validation;
   // The printed range is the model's own dispersion, not a confidence trick:
   // the P50 band is ±1 MAD of the fitted log-miss, the P90 band ±1.6449 MAD.
   const p50 = Math.exp(v.miss_mad);
   const p90 = Math.exp(1.6449 * v.miss_mad);
   return scored.map((entry, i) => {
-    const odds = tokenOddsOf(entry.proto, doc.as_of, universeTvl);
+    const odds = entry.odds;
     const verdict = farmVerdict(entry.proto, entry.age, entry.value, odds);
     return {
       rank: i + 1,
@@ -764,8 +934,15 @@ export function buildBoard(doc: SnapshotDoc, p: ScoreParams = SCORE_PARAMS): Boa
       symbol: entry.proto.symbol,
       token_status: 'pre-token' as const,
       age_days: entry.age,
-      implied_value_usd: entry.value,
+      // The ranked claim is the expected value: the implied value discounted by
+      // the fitted odds the token exists at all. It is monotonic with rank, as
+      // the gate requires, and it is the same claim the board's column states.
+      implied_value_usd: Math.max(1, Math.round(entry.expected)),
+      value_if_launched_usd: entry.value,
       token_odds: round5(odds),
+      odds_brier_cv: round5(oddsModel.brierCv),
+      odds_brier_wf: round5(oddsModel.brierWf),
+      odds_base_rate: round5(oddsModel.baseRate),
       on_watch: watchSet.has(entry.proto.slug),
       value_low_usd: Math.max(1, Math.round(entry.value / p50)),
       value_high_usd: Math.max(entry.value + 1, Math.round(entry.value * p50)),
