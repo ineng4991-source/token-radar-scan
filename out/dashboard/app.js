@@ -567,7 +567,16 @@ function masthead() {
       make('h3', { text: 'a printed range, honestly' }),
       make('p', { class: 'method', text: `Every row carries a P50 band (the model's ±1 MAD, about ${Math.exp(v.miss_mad).toFixed(2)}×) and a wider P90 band (±1.6449 MAD, about ${Math.exp(1.6449 * v.miss_mad).toFixed(2)}×). On the ${rh.n} priced protocols the P50 band holds ${Math.round(rh.p50 * 100)}% and the P90 band ${Math.round(rh.p90 * 100)}% — the ranges are reported, not tuned to look tight.` }),
       make('h3', { text: 'token odds, a separate claim' }),
-      make('p', { class: 'method', text: 'Token odds is a logistic base rate over the protocol’s TVL share, seven-day growth and age: the chance a token exists at all within the horizon. It is multiplied into each farm verdict so a high-value protocol with low odds is not over-farmed.' }),
+      make('p', { class: 'method', text: 'Token odds is a logistic fit on the snapshot’s own dated protocols — log TVL, seven-day growth, log age and chain count, with category effects shrunk toward the global rate by category size. It is a probability a token exists at all, kept apart from the implied value; it is multiplied into each farm verdict so a high-value protocol with low odds is not over-farmed.' }),
+      (() => {
+        const b = doc.rows && doc.rows[0] && typeof doc.rows[0].odds_brier_cv === 'number' ? doc.rows[0] : null;
+        if (!b) return null;
+        return make('div', { class: 'rail' }, [
+          make('div', { class: 'cell' }, [make('b', { text: b.odds_brier_cv.toFixed(3) }), make('span', { text: 'odds model, 10-fold CV Brier' })]),
+          make('div', { class: 'cell' }, [make('b', { text: b.odds_brier_wf.toFixed(3) }), make('span', { text: 'odds model, walk-forward Brier' })]),
+          make('div', { class: 'cell' }, [make('b', { text: b.odds_base_rate.toFixed(3) }), make('span', { text: 'dated protocols base rate' })])
+        ]);
+      })(),
       make('h3', { text: 'base weights' }),
       make('p', { class: 'method', text: weights }),
       make('p', { class: 'method', text: `Growth is clamped so one outlier week cannot dominate; unknown ages assume ${p.assumed_age_days} days. The board is a floor, never a ceiling: ${s.below_floor} protocols below the floor are ranked too.` })
