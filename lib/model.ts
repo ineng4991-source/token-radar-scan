@@ -46,6 +46,8 @@ export interface SnapshotDoc {
 export interface ScoreParams {
   tvl_exponent: number;
   tvl_scale: number;
+  peer_ratio_lo: number;
+  peer_ratio_hi: number;
   fee_floor: number;
   fee_gain: number;
   growth_clamp_lo: number;
@@ -65,6 +67,8 @@ export interface ScoreParams {
 export const SCORE_PARAMS: ScoreParams = {
   tvl_exponent: 0.85,
   tvl_scale: 1_000_000,
+  peer_ratio_lo: 0.3,
+  peer_ratio_hi: 20,
   fee_floor: 0.84,
   fee_gain: 0.1,
   growth_clamp_lo: -55,
@@ -274,12 +278,49 @@ export function daysSince(asOf: string, listedAt: string | null): number | null 
   return Math.max(0, Math.floor((a - b) / MS_PER_DAY));
 }
 
-function baseOf(category: string | null): { w: number; why: string } {
+function baseOf(category: string | null, peerBase?: PeerBase): { w: number; why: string } {
   if (category === null) return { w: FALLBACK_WEIGHT, why: 'no DefiLlama category, so the neutral weight applies' };
+  // Peer-derived first: the median mcap/TVL of the live tokens in this very
+  // category. A hardcoded table is a claim about names; this is a read of the
+  // snapshot. Categories with no traded peer fall back to the table, and a
+  // table row is only used where the peers say nothing.
+  const peer = peerBase?.byCat.get(category);
+  if (peer !== undefined && Number.isFinite(peer) && peer > 0) {
+    return { w: round5(peer), why: `median mcap/TVL of this category's own traded tokens` };
+  }
   for (const [re, w, why] of BASE_WEIGHTS) {
     if (re.test(category)) return { w, why };
   }
   return { w: FALLBACK_WEIGHT, why: `category ${category} has no bespoke weight, so the neutral one applies` };
+}
+
+/** Median mcap/TVL per category, read off the snapshot's own traded tokens. */
+interface PeerBase { byCat: Map<string, number>; n: number }
+
+function peerBaseOf(doc: SnapshotDoc, p: ScoreParams): PeerBase {
+  const byCat = new Map<string, number[]>();
+  for (const q of doc.protocols) {
+    if (q.mcap_usd === null || q.tvl_usd <= 0 || q.category === null) continue;
+    const r = q.mcap_usd / q.tvl_usd;
+    if (!(r > 0)) continue;
+    // A single thin trade (a token with almost no TVL and a fat mcap) would
+    // otherwise set the whole category's price. Winsorise each peer's ratio to
+    // the band before taking the median, so the median is the category's own
+    // central multiple, not its loudest outlier.
+    const clipped = Math.min(p.peer_ratio_hi, Math.max(p.peer_ratio_lo, r));
+    const arr = byCat.get(q.category);
+    if (arr) arr.push(clipped); else byCat.set(q.category, [clipped]);
+  }
+  const out = new Map<string, number>();
+  let n = 0;
+  for (const [cat, arr] of byCat) {
+    arr.sort((a, b) => a - b);
+    const mid = Math.floor(arr.length / 2);
+    const v = arr.length % 2 === 0 ? (arr[mid - 1]! + arr[mid]!) / 2 : arr[mid]!;
+    out.set(cat, v);
+    n += arr.length;
+  }
+  return { byCat: out, n };
 }
 
 function feeCurveOf(tvlUsd: number, p: ScoreParams): number {
@@ -307,9 +348,9 @@ function diversityOf(chains: string[], p: ScoreParams): { term: number; evm: boo
   return { term: 1 + Math.min(bonus, p.chain_cap) + (evm ? p.evm_bonus : 0), evm };
 }
 
-export function impliedUsd(proto: ProtoInput, asOf: string, p: ScoreParams): { value: number; breakdown: ScoreBreakdown } {
+export function impliedUsd(proto: ProtoInput, asOf: string, p: ScoreParams, peerBase?: PeerBase): { value: number; breakdown: ScoreBreakdown } {
   const age = daysSince(asOf, proto.listed_at);
-  const base = baseOf(proto.category);
+  const base = baseOf(proto.category, peerBase);
   const tvlTerm = Math.pow(proto.tvl_usd / p.tvl_scale, p.tvl_exponent);
   const fee = feeCurveOf(proto.tvl_usd, p);
   const { term: mom, used } = momentumOf(proto.change_7d, p);
@@ -533,15 +574,16 @@ function quantile(xs: number[], q: number): number {
   return s[i]!;
 }
 
-function missFor(pool: PricedProto[], asOf: string, p: ScoreParams): number[] {
+function missFor(pool: PricedProto[], asOf: string, p: ScoreParams, pb?: PeerBase): number[] {
   return pool.map((x) => {
-    const { value } = impliedUsd(x, asOf, p);
+    const { value } = impliedUsd(x, asOf, p, pb);
     return Math.log(x.mcap_usd / Math.max(value, 1));
   });
 }
 
 function fitStats(doc: SnapshotDoc): { split_a: number; split_b: number; oos: ModelStats['oos']; fitted: boolean; validation: ModelStats['validation']; scored: ScoreParams; dropped: string } {
   const pool = pricedPool(doc);
+  const pb = peerBaseOf(doc, SCORE_PARAMS);
   const n = pool.length;
   const bare: ScoreParams = { ...SCORE_PARAMS, tvl_exponent: SCORE_PARAMS.tvl_exponent, fee_gain: 0, growth_sensitivity: 0, maturity_gain: 0, chain_step: 0, evm_bonus: 0 };
   const emptyValidation = (note: string): ModelStats['validation'] => ({
@@ -574,15 +616,15 @@ function fitStats(doc: SnapshotDoc): { split_a: number; split_b: number; oos: Mo
     for (const fg of [0.0, 0.05, 0.1, 0.15, 0.2]) {
       for (const gs of [0.0, 0.3, 0.48, 0.7, 1.0]) {
         const p: ScoreParams = { ...SCORE_PARAMS, tvl_exponent: e, fee_gain: fg, growth_sensitivity: gs };
-        const m = median(missFor(train, doc.as_of, p).map(Math.abs));
+        const m = median(missFor(train, doc.as_of, p, pb).map(Math.abs));
         if (m < bestScore) { bestScore = m; best = { e, fg, gs }; }
       }
     }
   }
   const fittedParams: ScoreParams = { ...SCORE_PARAMS, tvl_exponent: best.e, fee_gain: best.fg, growth_sensitivity: best.gs };
-  const trainMiss = missFor(train, doc.as_of, fittedParams);
-  const holdMiss = missFor(hold, doc.as_of, fittedParams);
-  const allMiss = missFor(pool, doc.as_of, fittedParams);
+  const trainMiss = missFor(train, doc.as_of, fittedParams, pb);
+  const holdMiss = missFor(hold, doc.as_of, fittedParams, pb);
+  const allMiss = missFor(pool, doc.as_of, fittedParams, pb);
   const absMiss = allMiss.map(Math.abs);
   const q25 = quantile(absMiss, 0.25);
   const q75 = quantile(absMiss, 0.75);
@@ -598,8 +640,8 @@ function fitStats(doc: SnapshotDoc): { split_a: number; split_b: number; oos: Mo
   const ageCut = ages.length > 0 ? ages[Math.floor(ages.length / 2)]! : null;
   const old = ageCut === null ? [] : withAge.filter((x) => (daysSince(doc.as_of, x.listed_at) as number) <= ageCut);
   const young = ageCut === null ? [] : withAge.filter((x) => (daysSince(doc.as_of, x.listed_at) as number) > ageCut);
-  const missOld = old.length > 0 ? median(missFor(old, doc.as_of, fittedParams).map(Math.abs)) : 0;
-  const missYoung = young.length > 0 ? median(missFor(young, doc.as_of, fittedParams).map(Math.abs)) : 0;
+  const missOld = old.length > 0 ? median(missFor(old, doc.as_of, fittedParams, pb).map(Math.abs)) : 0;
+  const missYoung = young.length > 0 ? median(missFor(young, doc.as_of, fittedParams, pb).map(Math.abs)) : 0;
   // Rolling-origin: walk the dated windows forward. Each window trains on every
   // protocol listed before it and is scored on the ones that follow, the way the
   // board would actually be used — never on the future it is predicting.
@@ -611,7 +653,7 @@ function fitStats(doc: SnapshotDoc): { split_a: number; split_b: number; oos: Mo
     for (let i = 10; i + 6 <= byAge.length; i += step) {
       const tr = byAge.slice(0, i);
       const te = byAge.slice(i, i + 6);
-      windows.push({ train: tr.length, test: te.length, test_miss: round2(median(missFor(te, doc.as_of, fittedParams).map(Math.abs))) });
+      windows.push({ train: tr.length, test: te.length, test_miss: round2(median(missFor(te, doc.as_of, fittedParams, pb).map(Math.abs))) });
     }
   }
   // Every value term, tested blind against the bare curve: kept where it lowers
@@ -619,7 +661,7 @@ function fitStats(doc: SnapshotDoc): { split_a: number; split_b: number; oos: Mo
   // training set is a decoration, so the board is scored without it and the drop
   // is reported, not hidden. This runs last, so the reported params are the ones
   // the board is actually scored with.
-  const baselineMiss = median(missFor(hold, doc.as_of, { ...fittedParams, fee_gain: 0, growth_sensitivity: 0, maturity_gain: 0, chain_step: 0, evm_bonus: 0 }).map(Math.abs));
+  const baselineMiss = median(missFor(hold, doc.as_of, { ...fittedParams, fee_gain: 0, growth_sensitivity: 0, maturity_gain: 0, chain_step: 0, evm_bonus: 0 }, pb).map(Math.abs));
   const termDefs: { name: string; key: 'fee_gain' | 'growth_sensitivity' | 'maturity_gain' | 'chain_step' | 'evm_bonus'; on: ScoreParams; off: ScoreParams; note: string }[] = [
     { name: 'fee curve', key: 'fee_gain', on: { ...fittedParams, fee_gain: best.fg }, off: { ...fittedParams, fee_gain: 0 }, note: 'fee yield bends the curve' },
     { name: 'growth tilt', key: 'growth_sensitivity', on: { ...fittedParams, growth_sensitivity: best.gs }, off: { ...fittedParams, growth_sensitivity: 0 }, note: '7d change, clamped' },
@@ -628,14 +670,14 @@ function fitStats(doc: SnapshotDoc): { split_a: number; split_b: number; oos: Mo
     { name: 'EVM bonus', key: 'evm_bonus', on: { ...fittedParams, evm_bonus: SCORE_PARAMS.evm_bonus }, off: { ...fittedParams, evm_bonus: 0 }, note: 'EVM deployability' },
   ];
   const terms = termDefs.map((t) => {
-    const withTerm = median(missFor(hold, doc.as_of, t.on).map(Math.abs));
-    const without = median(missFor(hold, doc.as_of, t.off).map(Math.abs));
+    const withTerm = median(missFor(hold, doc.as_of, t.on, pb).map(Math.abs));
+    const without = median(missFor(hold, doc.as_of, t.off, pb).map(Math.abs));
     const delta = round2(without - withTerm);
     return { name: t.name, key: t.key, kept: delta >= 0, miss: round2(withTerm), delta, note: t.note };
   });
   const dropped = terms.filter((t) => !t.kept).map((t) => t.key);
   const scored: ScoreParams = dropped.reduce<ScoreParams>((acc, key) => ({ ...acc, [key]: 0 }), fittedParams);
-  const finalHold = median(missFor(hold, doc.as_of, scored).map(Math.abs));
+  const finalHold = median(missFor(hold, doc.as_of, scored, pb).map(Math.abs));
   const worst = windows.length > 0 ? round2(Math.max(...windows.map((w) => w.test_miss))) : 0;
   return {
     split_a: half,
@@ -691,11 +733,12 @@ export function buildBoard(doc: SnapshotDoc, p: ScoreParams = SCORE_PARAMS): Boa
   // board is scored with the kept set, and a term the test dropped is zeroed,
   // so the numbers on the page and the method card agree exactly.
   const fp: ScoreParams = fit.fitted ? fit.scored : p;
+  const pb = peerBaseOf(doc, SCORE_PARAMS);
 
   const universeTvl = doc.protocols.reduce((s, x) => s + x.tvl_usd, 0);
   const watchSet = new Set(doc.watchlist);
   const scored = [...picked.values()].map((proto) => {
-    const { value, breakdown } = impliedUsd(proto, doc.as_of, fp);
+    const { value, breakdown } = impliedUsd(proto, doc.as_of, fp, pb);
     return { proto, value, breakdown, age: daysSince(doc.as_of, proto.listed_at) };
   });
   scored.sort((a, b) => b.value - a.value || (a.proto.slug < b.proto.slug ? -1 : 1));
@@ -763,7 +806,7 @@ function modelStats(doc: SnapshotDoc, board: BoardLine[], p: ScoreParams): Model
   const median = impliedSorted.length % 2 === 0
     ? Math.round((impliedSorted[impliedSorted.length / 2 - 1]! + impliedSorted[impliedSorted.length / 2]!) / 2)
     : impliedSorted[(impliedSorted.length - 1) / 2]!;
-  const weights = BASE_WEIGHTS.slice().sort((a, b) => b[1] - a[1]).map(([re, w]) => [re.source, w] as [string, number]);
+  const weights = [...peerBaseOf(doc, SCORE_PARAMS).byCat.entries()].sort((a, b) => b[1] - a[1]).map(([cat, w]) => [cat, w] as [string, number]);
   const watchSet = new Set(doc.watchlist);
   const onBoard = new Set(board.map((r) => r.slug));
   const covered = board.filter((r) => watchSet.has(r.slug)).length;
