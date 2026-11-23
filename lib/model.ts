@@ -238,6 +238,7 @@ export interface RadarDoc {
   board_count: number;
   early_count: number;
   live_count: number;
+  odds_calibration: { band: string; n: number; pred: number; actual: number }[];
   stats: ModelStats;
   rows: BoardLine[];
   live: LiveLine[];
@@ -474,6 +475,7 @@ interface OddsModel {
   n: number;
   catRates: Map<string, { rate: number; traded: number; size: number }>;
   terms: string[];
+  calibration: { band: string; n: number; pred: number; actual: number }[];
 }
 
 function fitOdds(doc: SnapshotDoc): OddsModel {
@@ -528,7 +530,30 @@ function fitOdds(doc: SnapshotDoc): OddsModel {
     };
     return finalFn(r);
   };
-  return { predict, brierCv, brierWf, baseRate: globalRate, n: rows.length, catRates, terms: cols };
+  // Calibration: on the dated protocols, the model's 10-fold predictions against
+  // the base rate, in age bands — so the odds printed are seen to be honest on
+  // the very population they are quoted from.
+  const calPred = new Array<number>(rows.length).fill(globalRate);
+  for (let f = 0; f < 10; f++) {
+    const trIdx = rows.map((_, i) => i).filter((i) => i % 10 !== f);
+    const teIdx = rows.map((_, i) => i).filter((i) => i % 10 === f);
+    const m = fitOddsSub(trIdx.map((i) => rows[i]!), cats);
+    for (const i of teIdx) calPred[i] = m(rows[i]!);
+  }
+  const BANDS: [number, number][] = [[0, 0.5], [0.5, 1], [1, 2], [2, 3], [3, 5], [5, 1e9]];
+  const calibration = BANDS.map(([lo, hi]) => {
+    const idx = rows.map((_, i) => i).filter((i) => {
+      const a = (Math.exp(rows[i]!.age) - 1) / 365.25;
+      return a >= lo && a < hi;
+    });
+    return {
+      band: hi > 100 ? `${lo}+y` : `${lo}-${hi}y`,
+      n: idx.length,
+      pred: idx.length ? meanv(idx.map((i) => calPred[i]!)) : 0,
+      actual: idx.length ? meanv(idx.map((i) => (rows[i]!.token ? 1 : 0))) : 0,
+    };
+  }).filter((b) => b.n > 0);
+  return { predict, brierCv, brierWf, baseRate: globalRate, n: rows.length, catRates, terms: cols, calibration };
 }
 
 function peersOf(proto: ProtoInput, all: ProtoInput[], limit = 5): BoardLine['peers'] {
@@ -1004,6 +1029,7 @@ function modelStats(doc: SnapshotDoc, board: BoardLine[], p: ScoreParams): Model
 export function radarDoc(doc: SnapshotDoc, board: BoardLine[], p: ScoreParams = SCORE_PARAMS): RadarDoc {
   const live = liveLines(doc);
   const fit = fitStats(doc);
+  const oddsModel = fitOdds(doc);
   return {
     as_of: doc.as_of,
     source: doc.source,
@@ -1016,6 +1042,7 @@ export function radarDoc(doc: SnapshotDoc, board: BoardLine[], p: ScoreParams = 
     board_count: board.length,
     early_count: board.filter((r) => !doc.watchlist.includes(r.slug)).length,
     live_count: live.length,
+    odds_calibration: oddsModel.calibration,
     stats: modelStats(doc, board, p),
     rows: board,
     live,

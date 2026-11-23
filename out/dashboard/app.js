@@ -577,6 +577,23 @@ function masthead() {
           make('div', { class: 'cell' }, [make('b', { text: b.odds_base_rate.toFixed(3) }), make('span', { text: 'dated protocols base rate' })])
         ]);
       })(),
+      (() => {
+        const cal = doc.odds_calibration;
+        if (!Array.isArray(cal) || !cal.length) return null;
+        const head = ['age band', 'dated', 'model', 'actual'];
+        const rowsHtml = cal.map((c) => make('tr', null, [
+          make('td', { text: c.band }), make('td', { class: 'num', text: String(c.n) }),
+          make('td', { class: 'num', text: c.pred.toFixed(3) }), make('td', { class: 'num', text: c.actual.toFixed(3) })
+        ]));
+        return make('div', null, [
+          make('h3', { text: 'odds calibration, out of fold' }),
+          make('p', { class: 'method', text: 'The odds model’s 10-fold predictions against the dated protocols’ own base rate, in age bands — the odds printed are seen to be honest on the population they are quoted from.' }),
+          make('table', { class: 'cal' }, [
+            make('thead', null, [make('tr', null, head.map((h) => make('th', { text: h })))]),
+            make('tbody', null, rowsHtml)
+          ])
+        ]);
+      })(),
       make('h3', { text: 'base weights' }),
       make('p', { class: 'method', text: weights }),
       make('p', { class: 'method', text: `Growth is clamped so one outlier week cannot dominate; unknown ages assume ${p.assumed_age_days} days. The board is a floor, never a ceiling: ${s.below_floor} protocols below the floor are ranked too.` })
